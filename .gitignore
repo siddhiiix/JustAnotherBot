@@ -1,6 +1,36 @@
+
+# Secrets and environment variables
 .env
-__pycache__/
-*.py[cod]
+.env.*
+!.env.example
+
+# Python virtual environment
 .venv/
 venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local databases and persistent memory
 *.db
+*.sqlite
+*.sqlite3
+chroma_db/
+
+# Private documents and uploaded source material
+documents/
+
+# Logs
+*.log
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backup files
+*_backup.py

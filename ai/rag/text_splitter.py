@@ -1,196 +1,181 @@
+"""General-purpose structure-aware text splitting with page metadata."""
 
 import re
 
-
-CHAPTER_PATTERN = re.compile(
-    r"(?m)^\s*##\s+"
-    r"(?:Chapter|Chap\.?)\s+.+$",
+PAGE_RE = re.compile(r"^\s*\[Page\s*:?[ \t]*(\d+)\]\s*$", re.IGNORECASE)
+HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+CHAPTER_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:chapter|chap\.?|part|book)\s+"
+    r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|"
+    r"tenth|eleventh|twelfth|[IVXLCDM]+|\d+)\b\s*[:.\-–—]?\s*(.*?)\s*$",
     re.IGNORECASE,
 )
 
-HEADING_PATTERN = re.compile(
-    r"(?m)^\s*(#{2,3})\s+(.+?)\s*$"
-)
+WORDS = {
+    "one": 1, "first": 1, "two": 2, "second": 2,
+    "three": 3, "third": 3, "four": 4, "fourth": 4,
+    "five": 5, "fifth": 5, "six": 6, "sixth": 6,
+    "seven": 7, "seventh": 7, "eight": 8, "eighth": 8,
+    "nine": 9, "ninth": 9, "ten": 10, "tenth": 10,
+    "eleven": 11, "eleventh": 11, "twelve": 12, "twelfth": 12,
+}
+ROMANS = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6,
+    "vii": 7, "viii": 8, "ix": 9, "x": 10, "xi": 11, "xii": 12,
+}
 
-PAGE_PATTERN = re.compile(
-    r"(?m)^\[Page\s+(\d+)\]\s*$",
-    re.IGNORECASE,
-)
+
+def _chapter_heading(line: str):
+    """Return (normalized chapter label, chapter number) for explicit headings."""
+    clean = line.strip()
+    heading_match = HEADING_RE.match(clean)
+    if heading_match:
+        clean = heading_match.group(2).strip()
+    match = CHAPTER_RE.match(clean)
+    if not match:
+        return None, None
+
+    label = match.group(1)
+    label_lower = label.lower()
+    if label_lower.isdigit():
+        number = int(label_lower)
+    else:
+        number = WORDS.get(label_lower, ROMANS.get(label_lower, -1))
+
+    title = (match.group(2) or "").strip(" .:-–—")
+    kind_match = re.match(r"(?i)(chapter|chap\.?|part|book)", clean)
+    kind = kind_match.group(1).title() if kind_match else "Chapter"
+    heading = f"{kind} {label.upper() if label_lower in ROMANS else label}"
+    if title:
+        heading += f": {title}"
+    return heading, number
 
 
-def split_text(
-    text: str,
-    chunk_size: int = 1000,
-    chunk_overlap: int = 150,
-) -> list[str]:
+def split_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 150) -> list[str]:
+    """Split text on structural boundaries, but do not flush at every page.
+
+    Page markers remain inside the text so chunks can span pages without losing
+    page provenance. Each emitted chunk also receives a page metadata prefix
+    containing the first page represented in that chunk.
     """
-    Split a document into overlapping chunks while preserving structure.
-
-    Supports:
-    - Chapter and section headings
-    - PDF page markers
-    - Documents without headings
-    - Introductory material before the first heading
-
-    Returns list[str] for compatibility with the existing ingestion pipeline.
-    """
-
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than zero.")
-
-    if chunk_overlap < 0:
-        raise ValueError("chunk_overlap cannot be negative.")
-
-    if chunk_overlap >= chunk_size:
-        raise ValueError(
-            "chunk_overlap must be smaller than chunk_size."
-        )
-
-    text = text.strip()
-
-    if not text:
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be >= 0 and smaller than chunk_size.")
+    if not text or not text.strip():
         return []
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    sections = _extract_sections(text)
-    chunks = []
-
-    for heading, page, section_text in sections:
-        if not section_text.strip():
-            continue
-
-        prefix_parts = []
-
-        if heading:
-            prefix_parts.append(f"[Section: {heading}]")
-
-        if page is not None:
-            prefix_parts.append(f"[Page: {page}]")
-
-        prefix = "\n".join(prefix_parts)
-
-        # Reserve room for the metadata prefix.
-        content_size = max(1, chunk_size - len(prefix) - 1)
-
-        section_chunks = _split_section(
-            section_text=section_text,
-            chunk_size=content_size,
-            chunk_overlap=min(chunk_overlap, content_size - 1)
-            if content_size > 1
-            else 0,
-        )
-
-        for content in section_chunks:
-            chunk = f"{prefix}\n{content}" if prefix else content
-            chunks.append(chunk)
-
-    return chunks
-
-
-def _extract_sections(text: str) -> list[tuple[str | None, int | None, str]]:
-    """
-    Split text at headings and page markers.
-
-    A page marker updates the page metadata for subsequent content.
-    Headings update the current section metadata.
-    """
-
+    # A section is a logical heading-delimited region. Page markers are kept
+    # in its body instead of flushing it, preventing tiny page-sized chunks.
     sections = []
-
-    current_heading = None
-    current_page = None
-    current_lines = []
+    lines = []
+    chapter = "Unknown"
+    chapter_number = -1
+    section = "Unknown"
 
     def flush():
-        content = "\n".join(current_lines).strip()
-
-        if content:
-            sections.append(
-                (current_heading, current_page, content)
-            )
+        nonlocal lines
+        body = "\n".join(lines).strip()
+        if body:
+            sections.append((chapter, chapter_number, section, body))
+        lines = []
 
     for line in text.splitlines():
-        stripped = line.strip()
-
-        page_match = PAGE_PATTERN.fullmatch(stripped)
-
-        if page_match:
+        heading, number = _chapter_heading(line)
+        heading_match = HEADING_RE.match(line.strip())
+        if heading:
             flush()
-            current_lines.clear()
-            current_page = int(page_match.group(1))
-            continue
-
-        heading_match = HEADING_PATTERN.fullmatch(stripped)
-
-        if heading_match:
+            chapter = heading
+            chapter_number = number
+            section = heading
+            lines.append(line.strip())
+        elif heading_match:
             flush()
-            current_lines.clear()
-            current_heading = heading_match.group(2).strip()
-            current_lines.append(stripped)
-            continue
-
-        current_lines.append(line)
-
+            section = heading_match.group(2).strip()
+            lines.append(line.strip())
+        else:
+            # Preserve page markers within the content for page-aware chunking.
+            lines.append(line)
     flush()
 
-    if not sections:
-        return [(None, None, text.strip())]
+    output = []
+    for chap, chap_no, sect, body in sections:
+        # Reserve space for the metadata prefix, so actual content stays close
+        # to the requested chunk size.
+        base_prefix = f"[Chapter: {chap}]\n[ChapterNumber: {chap_no}]\n[Section: {sect}]"
+        budget = max(200, chunk_size - len(base_prefix) - 35)
+        overlap = min(chunk_overlap, max(0, budget // 4))
+        pieces = _split_body(body, budget, overlap)
 
-    return sections
+        current_page = None
+        for piece in pieces:
+            page = _first_page_in_text(piece)
+            if page is not None:
+                current_page = page
+            prefix = base_prefix
+            if current_page is not None:
+                prefix += f"\n[Page: {current_page}]"
+            output.append(f"{prefix}\n{piece}")
+    return output
 
 
-def _split_section(
-    section_text: str,
-    chunk_size: int,
-    chunk_overlap: int,
-) -> list[str]:
-    """Split a section near natural text boundaries."""
+def _first_page_in_text(text: str):
+    for line in text.splitlines():
+        match = PAGE_RE.match(line.strip())
+        if match:
+            return int(match.group(1))
+    return None
 
-    if len(section_text) <= chunk_size:
-        return [section_text.strip()]
+
+def _split_body(text: str, size: int, overlap: int) -> list[str]:
+    """Split near paragraph/sentence boundaries, with safe character fallback."""
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
 
     chunks = []
     start = 0
-    text_length = len(section_text)
-
+    text_length = len(text)
     while start < text_length:
-        end = min(start + chunk_size, text_length)
-
+        end = min(start + size, text_length)
         if end < text_length:
-            search_start = start + chunk_size // 2
-
-            boundaries = [
-                section_text.rfind("\n\n", search_start, end),
-                section_text.rfind("\n", search_start, end),
-                section_text.rfind(". ", search_start, end),
-                section_text.rfind("? ", search_start, end),
-                section_text.rfind("! ", search_start, end),
+            floor = start + int(size * 0.55)
+            # Prefer paragraph, then line, then sentence boundaries.
+            paragraph_boundary = text.rfind("\n\n", floor, end)
+            line_boundary = text.rfind("\n", floor, end)
+            sentence_boundaries = [
+                text.rfind(". ", floor, end),
+                text.rfind("? ", floor, end),
+                text.rfind("! ", floor, end),
             ]
-
-            boundary = max(boundaries)
-
-            if boundary > start:
+            if paragraph_boundary > start:
+                boundary = paragraph_boundary
+                end = boundary + 2
+            elif line_boundary > start:
+                boundary = line_boundary
                 end = boundary + 1
+            else:
+                boundary = max(sentence_boundaries)
+                if boundary > start:
+                    end = boundary + 2
 
-        content = section_text[start:end].strip()
-
-        if content:
-            chunks.append(content)
-
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
         if end >= text_length:
             break
 
-        next_start = max(start + 1, end - chunk_overlap)
-
-        # Prefer beginning the next chunk at a word boundary.
-        whitespace = section_text.find(" ", next_start, end)
-
-        if whitespace != -1:
-            next_start = whitespace + 1
-
-        start = next_start
+        next_start = max(start + 1, end - overlap)
+        # Avoid starting in the middle of a word.
+        while next_start < end and not text[next_start].isspace():
+            next_start += 1
+        start = min(next_start + 1, end)
 
     return chunks

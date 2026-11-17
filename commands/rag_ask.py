@@ -5,7 +5,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import DISCORD_MESSAGE_LIMIT
-from ai.rag.rag_pipeline import ask_documents
+from ai.bot_graph import run_rag_graph
 
 logger = logging.getLogger("JustAnotherBot.RAG")
 
@@ -23,7 +23,7 @@ class RAGAskCommands(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
-            result = await ask_documents(question)
+            result = await run_rag_graph(question)
             answer = (result.get("answer") or "I couldn't produce an answer.").strip()
             sources = result.get("sources") or []
 

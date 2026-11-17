@@ -1,3 +1,4 @@
+"""General-purpose PDF/TXT loader with page and heading preservation."""
 
 from pathlib import Path
 import logging
@@ -9,135 +10,106 @@ logger = logging.getLogger("JustAnotherBot.RAG")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOCUMENTS_DIR = PROJECT_ROOT / "documents"
-
 SUPPORTED_EXTENSIONS = {".pdf", ".txt"}
 
-# Common chapter-heading formats.
 CHAPTER_PATTERN = re.compile(
     r"^\s*(?:chapter|chap\.?)\s+"
-    r"(?:\d+|[IVXLCDM]+|one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"(?:\d+|[IVXLCDM]+|one|two|three|four|five|six|seven|eight|"
+    r"nine|ten|eleven|twelve|first|second|third|fourth|fifth|"
+    r"sixth|seventh|eighth|ninth|tenth|eleventh|twelfth)\b"
     r"(?:\s*[:.\-–—]\s*.*|\s+.*)?$",
     re.IGNORECASE,
 )
 
-# Common numbered section headings, such as:
-# 1 Introduction
-# 2.1 Data Collection
-# 3.2.1 Evaluation
 NUMBERED_HEADING_PATTERN = re.compile(
     r"^\s*\d+(?:\.\d+){0,4}\.?\s+[A-Z][^\n]{0,120}$"
 )
 
-# Common standalone headings.
 STANDALONE_HEADING_PATTERN = re.compile(
-    r"^\s*(?:"
-    r"abstract|introduction|background|"
-    r"literature review|related work|"
-    r"methodology|methods|materials and methods|"
-    r"results|discussion|conclusion|conclusions|"
-    r"references|bibliography|appendix|"
-    r"acknowledgements|acknowledgments"
-    r")\s*:?\s*$",
+    r"^\s*(?:abstract|introduction|background|literature review|"
+    r"related work|methodology|methods|materials and methods|"
+    r"results|discussion|conclusion|conclusions|references|"
+    r"bibliography|appendix|acknowledgements|acknowledgments)\s*:?[ \t]*$",
     re.IGNORECASE,
 )
 
+PAGE_MARKER_PATTERN = re.compile(r"^\[Page\s*:?[ \t]*\d+\]$", re.IGNORECASE)
+
+
+def _repair_pdf_line_breaks(text: str) -> str:
+    """Repair common PDF extraction artefacts without flattening paragraphs."""
+    # Join words split by a line-ending hyphen (e.g. "exam-\nple" -> "example").
+    text = re.sub(r"(?<=[A-Za-z])-[ \t]*\n[ \t]*(?=[a-z])", "", text)
+    # Dehyphenate soft hyphens that sometimes survive PDF extraction.
+    text = text.replace("\u00ad", "")
+    return text
+
 
 def normalize_text(text: str) -> str:
-    """Normalize whitespace while preserving paragraphs and page markers."""
+    """Normalize whitespace while preserving page markers and headings."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\x00", "")
+    text = text.replace("\x00", "").replace("\u00ad", "")
+    text = _repair_pdf_line_breaks(text)
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    lines = []
-
-    for line in text.splitlines():
-        stripped = line.strip()
-
-        if not stripped:
-            lines.append("")
-            continue
-
-        # Preserve existing page markers.
-        if re.fullmatch(r"\[Page\s+\d+\]", stripped, re.IGNORECASE):
-            lines.append(stripped)
-            continue
-
-        # Preserve existing Markdown headings.
-        if stripped.startswith("#"):
-            lines.append(stripped)
-            continue
-
-        if CHAPTER_PATTERN.match(stripped):
-            lines.append(f"\n## {stripped}\n")
-        elif STANDALONE_HEADING_PATTERN.match(stripped):
-            lines.append(f"\n### {stripped}\n")
-        elif NUMBERED_HEADING_PATTERN.match(stripped):
-            lines.append(f"\n### {stripped}\n")
+    output_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            output_lines.append("")
+        elif PAGE_MARKER_PATTERN.fullmatch(line):
+            output_lines.append(line)
+        elif line.startswith("#"):
+            output_lines.append(line)
+        elif CHAPTER_PATTERN.match(line):
+            output_lines.extend(["", f"## {line}", ""])
+        elif STANDALONE_HEADING_PATTERN.match(line) or NUMBERED_HEADING_PATTERN.match(line):
+            output_lines.extend(["", f"### {line}", ""])
         else:
-            lines.append(stripped)
+            output_lines.append(line)
 
-    text = "\n".join(lines)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
+    normalized = "\n".join(output_lines)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
 
 
 def load_pdf(file_path: Path) -> str:
-    """Extract PDF text while preserving page boundaries."""
+    """Extract PDF text page by page, retaining explicit page markers."""
     pages = []
-
     with pymupdf.open(file_path) as document:
         for page_number, page in enumerate(document, start=1):
-            page_text = page.get_text("text").strip()
-
+            page_text = page.get_text("text", sort=True).strip()
             if not page_text:
                 continue
-
             page_text = normalize_text(page_text)
-
             if page_text:
                 pages.append(f"[Page {page_number}]\n{page_text}")
-
     return "\n\n".join(pages)
 
 
 def load_txt(file_path: Path) -> str:
-    """Read and normalize a UTF-8 text file."""
+    """Load and normalize a UTF-8 text file."""
     text = file_path.read_text(encoding="utf-8-sig")
     return normalize_text(text)
 
 
 def detect_structure(text: str) -> dict:
-    """Detect basic document structure without assuming every file has chapters."""
+    """Detect explicit chapter headings, section headings, and page markers."""
     chapter_headings = []
     section_headings = []
     page_markers = []
 
-    current_chapter = None
-
     for line in text.splitlines():
         stripped = line.strip()
-
-        page_match = re.fullmatch(
-            r"\[Page\s+(\d+)\]",
-            stripped,
-            re.IGNORECASE,
-        )
-
+        page_match = re.fullmatch(r"\[Page\s*:?[ \t]*(\d+)\]", stripped, re.IGNORECASE)
         if page_match:
             page_markers.append(int(page_match.group(1)))
-            continue
-
-        if stripped.startswith("## "):
+        elif stripped.startswith("## "):
             heading = stripped[3:].strip()
-
             if CHAPTER_PATTERN.match(heading):
-                current_chapter = heading
                 chapter_headings.append(heading)
             else:
                 section_headings.append(heading)
-
         elif stripped.startswith("### "):
             section_headings.append(stripped[4:].strip())
 
@@ -150,25 +122,18 @@ def detect_structure(text: str) -> dict:
 
 
 def load_document(file_path: str | Path) -> dict:
-    """Load one supported document and return its text and structure metadata."""
+    """Load one supported document and return extracted text and structure."""
     file_path = Path(file_path).expanduser().resolve()
-
     if not file_path.is_file():
         raise FileNotFoundError(f"Document not found: {file_path}")
 
     extension = file_path.suffix.lower()
-
     if extension not in SUPPORTED_EXTENSIONS:
         raise ValueError(
-            f"Unsupported file type: {extension}. "
-            "Supported formats: PDF and TXT."
+            f"Unsupported file type: {extension}. Supported formats: PDF and TXT."
         )
 
-    if extension == ".pdf":
-        text = load_pdf(file_path)
-    else:
-        text = load_txt(file_path)
-
+    text = load_pdf(file_path) if extension == ".pdf" else load_txt(file_path)
     if not text.strip():
         raise ValueError(
             f"No extractable text found in {file_path.name}. "
@@ -176,43 +141,27 @@ def load_document(file_path: str | Path) -> dict:
         )
 
     structure = detect_structure(text)
-
     logger.info(
-        "Loaded %s: %s characters, %s chapter headings, "
-        "%s section headings, %s page markers.",
+        "Loaded %s: %s chars | chapters=%s %s | sections=%s | pages=%s",
         file_path.name,
         len(text),
         structure["chapter_count"],
+        structure["chapter_headings"],
         len(structure["section_headings"]),
         structure["page_count"],
     )
-
-    return {
-        "source": file_path.name,
-        "text": text,
-        "structure": structure,
-    }
+    return {"source": file_path.name, "text": text, "structure": structure}
 
 
 def load_all_documents() -> list[dict]:
-    """Load supported documents from the documents directory."""
+    """Load all supported documents from the documents directory."""
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-
     documents = []
-
     for file_path in sorted(DOCUMENTS_DIR.iterdir()):
-        if not file_path.is_file():
+        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             continue
-
-        if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-
         try:
             documents.append(load_document(file_path))
         except Exception:
-            logger.exception(
-                "Could not load document: %s",
-                file_path.name,
-            )
-
+            logger.exception("Could not load document: %s", file_path.name)
     return documents

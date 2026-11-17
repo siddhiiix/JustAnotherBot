@@ -162,4 +162,8 @@ Features and interfaces may change as new capabilities are implemented and exist
 
 ## 👩‍💻 Author
 
+<<<<<<< HEAD
 Developed as a personal project to explore practical applications of local language models, conversational AI, persistent memory, and Retrieval-Augmented Generation.
+=======
+Developed as a personal project to explore practical applications of local language models, conversational AI, persistent memory, and Retrieval-Augmented Generation.
+>>>>>>> origin/main
